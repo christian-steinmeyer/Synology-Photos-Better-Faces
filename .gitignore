@@ -22,3 +22,7 @@ config.toml
 *.db-shm
 *.har
 *.log
+
+# Private deployment configuration (never commit credentials).
+deploy/compose.local.yaml
+deploy/accounts.json

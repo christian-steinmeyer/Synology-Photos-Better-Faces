@@ -1,0 +1,81 @@
+# Paste this entire YAML into Synology Container Manager → Project → Create.
+# Edit the values locally. Do not publish a copy containing passwords.
+services:
+  better-faces:
+    image: ghcr.io/christian-steinmeyer/synology-photos-better-faces:cpu
+    restart: unless-stopped
+    init: true
+    entrypoint: ["python", "-m", "synopticon.headless"]
+    command: ["daemon"]
+    environment:
+      # DSM credentials (one login per Personal Space; one for Shared Space).
+      SYNOLOGY_URL: "https://nas.example.com:5001"
+      SYNOLOGY_VERIFY_TLS: "true"
+      DSM_PASSWORD_USER1: "replace-me"
+      DSM_PASSWORD_USER2: "replace-me"
+      DSM_PASSWORD_SHARED: "replace-me"
+      # Optional per-account one-time 2FA codes: specify otp_env in the roster.
+      # Do not disable 2FA on existing accounts.
+      SPBF_ACCOUNTS_JSON: >-
+        {"accounts":[
+          {"id":"user1","username":"user1","password_env":"DSM_PASSWORD_USER1","spaces":["personal"]},
+          {"id":"user2","username":"user2","password_env":"DSM_PASSWORD_USER2","spaces":["personal"]},
+          {"id":"shared","username":"photos-service","password_env":"DSM_PASSWORD_SHARED","spaces":["shared"]}
+        ]}
+
+      # Headless scheduling and storage.
+      # Use upstream config loading with an empty TOML source.
+      SYNOPTICON_CONFIG: "/dev/null"
+      SPBF_DATA_DIR: "/data"
+      SPBF_MODELS_DIR: "/models"
+      SPBF_DOWNLOAD_MODELS: "true"
+      SPBF_INTERVAL_HOURS: "24"
+      SPBF_EXTRACT_LIMIT: "0"
+
+      # Safe defaults: enable writeback only after disposable-photo testing.
+      SPBF_WRITE_ENABLED: "false"
+      SPBF_NATIVE_REVIEW_ENABLED: "false"
+      SPBF_AUTO_ASSIGN_ENABLED: "false"
+      SPBF_CALIBRATION_APPROVED: "false"
+      SPBF_MIN_SIMILARITY: "0.90"
+      SPBF_MAX_WRITES: "20"
+      SPBF_MAX_GROUP_FACES: "200"
+
+      # Upstream pipeline configuration (all settings support this env syntax).
+      SYNOPTICON_NAS__REQUESTS_PER_SECOND: "2.0"
+      SYNOPTICON_NAS__WRITE_REQUESTS_PER_SECOND: "1.0"
+      SYNOPTICON_NAS__TIMEOUT_S: "60"
+      SYNOPTICON_STORAGE__KEEP_ORIGINALS: "false"
+      # Originals cache budget in GB per account; allow additional space for models and metadata.
+      SYNOPTICON_STORAGE__ORIGINALS_CACHE_GB: "10"
+      SYNOPTICON_DATABASE__BACKEND: "sqlite"
+      SYNOPTICON_INFERENCE__DEVICE: "cpu"
+      # Reduce batch size if inference exceeds the available memory.
+      SYNOPTICON_INFERENCE__BATCH_SIZE: "8"
+      # Match inference threads to the CPU allocation below.
+      SYNOPTICON_INFERENCE__INTRA_OP_THREADS: "2"
+      SYNOPTICON_DETECTION__SCALES: "[1.0]"
+      SYNOPTICON_DETECTION__SCRFD_SCORE: "0.45"
+      SYNOPTICON_DETECTION__YOLO_SCORE: "0.45"
+      SYNOPTICON_DETECTION__MIN_FACE_PX: "24"
+      SYNOPTICON_CROSSREF__NEW_PERSON_MIN_FACES: "5"
+      SYNOPTICON_CROSSREF__NEW_PERSON_MIN_PHOTOS: "8"
+
+    # Relative paths refer to the Container Manager project directory.
+    volumes:
+      - ./data:/data
+      - ./models:/models
+    # Example resource limits: adjust to the capacity of your Disk Station.
+    # CPU time in logical-core equivalents; leave capacity for DSM.
+    cpus: 2.0
+    # Maximum container memory, not a reservation. Monitor clustering and inference
+    # and adjust for library size, enabled models, and available RAM.
+    mem_limit: 4g
+    security_opt: ["no-new-privileges:true"]
+    cap_drop: ["ALL"]
+    pids_limit: 256
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
