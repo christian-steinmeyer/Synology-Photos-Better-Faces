@@ -114,7 +114,6 @@ def account_environment(account: dict[str, Any], *, data_root: Path) -> dict[str
 def run_pipeline(accounts: list[dict[str, Any]], *, data_root: Path, extract_limit: int) -> None:
     failures = []
     for account in accounts:
-        env = account_environment(account, data_root=data_root)
         # Each process is isolated by its environment and per-account database.
         # These commands only read Synology Photos; cluster modifies local DB.
         commands = [
@@ -123,20 +122,26 @@ def run_pipeline(accounts: list[dict[str, Any]], *, data_root: Path, extract_lim
             ["cluster"],
         ]
         try:
+            env = account_environment(account, data_root=data_root)
             for command in commands:
                 LOG.info("account=%s command=%s started", account["id"], command[0])
                 subprocess.run([sys.executable, "-m", "synopticon", *command],
                                env=env, check=True)
                 LOG.info("account=%s command=%s completed", account["id"], command[0])
+            write_errors = []
             for sp in account["spaces"]:
-                subprocess.run(
+                result = subprocess.run(
                     [sys.executable, "-m", "synopticon.native_review", "run", "--space", sp],
-                    env=env, check=True,
+                    env=env, check=False,
                 )
+                if result.returncode:
+                    write_errors.append(sp)
             subprocess.run(
                 [sys.executable, "-m", "synopticon.native_review", "report"],
                 env=env, check=True,
             )
+            if write_errors:
+                raise RuntimeError("Native review failed in: " + ", ".join(write_errors))
         except Exception:
             failures.append(account["id"])
             LOG.exception("Account failed: %s", account["id"])
@@ -193,7 +198,12 @@ def main(argv: list[str] | None = None) -> int:
     if extract_limit < 0:
         raise ValueError("SPBF_EXTRACT_LIMIT must be >= 0 (0 means all pending photos)")
     while True:
-        run_pipeline(accounts, data_root=data_root, extract_limit=extract_limit)
+        try:
+            run_pipeline(accounts, data_root=data_root, extract_limit=extract_limit)
+        except Exception:
+            if args.command == "once":
+                raise
+            LOG.exception("Cycle failed; retrying on the normal schedule")
         if args.command == "once":
             return 0
         LOG.info("cycle complete; next pass in %d hours", interval_hours)

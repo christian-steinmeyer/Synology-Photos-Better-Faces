@@ -69,3 +69,31 @@ def test_shared_space_single_account(monkeypatch):
     ]}))
     with pytest.raises(ValueError, match="only one account"):
         load_accounts()
+
+
+def test_failures_do_not_skip_other_accounts_or_spaces(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    from synopticon import headless
+
+    def environment(account, *, data_root):
+        if account["id"] == "broken":
+            raise ValueError("SYNOLOGY_URL is required")
+        return {"ACCOUNT": account["id"]}
+
+    calls = []
+
+    def run(cmd, env, check):
+        calls.append(cmd[2:])
+        return SimpleNamespace(returncode=int(cmd[-1] == "personal"))
+
+    monkeypatch.setattr(headless, "account_environment", environment)
+    monkeypatch.setattr(headless.subprocess, "run", run)
+    accounts = [{"id": "broken", "spaces": ["personal"]},
+                {"id": "ok", "spaces": ["personal", "shared"]}]
+    with pytest.raises(RuntimeError, match="broken, ok"):
+        headless.run_pipeline(accounts, data_root=tmp_path, extract_limit=0)
+    assert calls[-3:] == [
+        ["synopticon.native_review", "run", "--space", "personal"],
+        ["synopticon.native_review", "run", "--space", "shared"],
+        ["synopticon.native_review", "report"],
+    ]

@@ -99,11 +99,17 @@ def _journal(conn) -> None:
     """)
     conn.execute("""
         CREATE TABLE IF NOT EXISTS spbf_native_groups (
-            review_id INTEGER PRIMARY KEY,
+            review_id INTEGER NOT NULL,
             space TEXT NOT NULL,
-            person_id INTEGER NOT NULL
+            person_id INTEGER NOT NULL,
+            PRIMARY KEY (review_id, space)
         )
     """)
+    conn.execute("""CREATE TABLE IF NOT EXISTS spbf_native_retry (
+        review_id INTEGER NOT NULL, space TEXT NOT NULL,
+        failures INTEGER NOT NULL, retry_at INTEGER NOT NULL, error TEXT NOT NULL,
+        PRIMARY KEY (review_id, space)
+    )""")
     conn.commit()
 
 
@@ -124,9 +130,9 @@ def _note(conn, review_id, local_face_id, space, photo_id, face_id, person_id, s
     conn.commit()
 
 
-def _group_person(conn, review_id: int) -> int | None:
+def _group_person(conn, review_id: int, space: str) -> int | None:
     row = conn.execute(
-        "SELECT person_id FROM spbf_native_groups WHERE review_id=?", (review_id,)
+        "SELECT person_id FROM spbf_native_groups WHERE review_id=? AND space=?", (review_id, space)
     ).fetchone()
     return int(row["person_id"]) if row else None
 
@@ -134,7 +140,7 @@ def _group_person(conn, review_id: int) -> int | None:
 def _save_group(conn, review_id: int, space: str, person_id: int):
     conn.execute(
         "INSERT INTO spbf_native_groups(review_id,space,person_id) VALUES (?,?,?) "
-        "ON CONFLICT(review_id) DO UPDATE SET person_id=excluded.person_id",
+        "ON CONFLICT(review_id,space) DO UPDATE SET person_id=excluded.person_id",
         (review_id, space, person_id),
     )
     conn.commit()
@@ -345,77 +351,119 @@ def _set_status(conn, row_id: int, status: str) -> None:
     conn.commit()
 
 
+def _pending_faces(conn, review_id, faces):
+    completed = {
+        (row["space"], row["local_face_id"])
+        for row in conn.execute(
+            "SELECT space, local_face_id FROM spbf_native_journal "
+            "WHERE review_id=? AND state='complete'", (review_id,)
+        )
+    }
+    return [face for face in faces if (face[1], face[0]) not in completed]
+
+
+def _record_failure(conn, review_id, space, exc):
+    prior = conn.execute(
+        "SELECT failures FROM spbf_native_retry WHERE review_id=? AND space=?",
+        (review_id, space),
+    ).fetchone()
+    failures = (int(prior["failures"]) if prior else 0) + 1
+    # Retry with exponential backoff, capped at one week. Keep the original
+    # pending proposal and any incomplete write journal for reconciliation.
+    delay = min(7 * 86400, 3600 * 2 ** min(failures - 1, 8))
+    conn.execute("""
+        INSERT INTO spbf_native_retry(review_id, space, failures, retry_at, error)
+        VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(review_id, space) DO UPDATE SET failures=excluded.failures,
+        retry_at=excluded.retry_at, error=excluded.error
+    """, (review_id, space, failures, int(time.time()) + delay, str(exc)[:1000]))
+    conn.commit()
+
+
+def _clear_failure(conn, review_id, space):
+    conn.execute("DELETE FROM spbf_native_retry WHERE review_id=? AND space=?",
+                 (review_id, space))
+    conn.commit()
+
+
 def process(conn, client, space: str, policy: Policy, *, preview: bool = False) -> dict:
-    """Process pending proposals. Writes only if policy explicitly enables them."""
+    """Process pending proposals independently by space; defer failing rows."""
     _journal(conn)
     rows = conn.execute("""
-        SELECT * FROM review_queue WHERE status='pending'
-          AND kind IN ('assign','low_confidence','new_person')
-        ORDER BY CASE kind WHEN 'new_person' THEN 0 ELSE 1 END, item_id
-    """).fetchall()
+        SELECT q.* FROM review_queue q
+        LEFT JOIN spbf_native_retry r ON r.review_id=q.item_id AND r.space=?
+        WHERE q.status='pending' AND q.kind IN ('assign','low_confidence','new_person')
+        ORDER BY CASE WHEN r.failures IS NULL THEN 0 ELSE 1 END,
+                 COALESCE(r.retry_at, 0),
+                 CASE q.kind WHEN 'new_person' THEN 0 ELSE 1 END, q.item_id
+    """, (space,)).fetchall()
     stats = {"proposals": len(rows), "assigned": 0, "unknown_groups": 0,
-             "skipped": 0, "failed": 0, "face_writes": 0}
+             "skipped": 0, "failed": 0, "deferred": 0, "face_writes": 0}
     can_write = policy.write and not preview
     if not (policy.native_review or policy.auto_assign):
         return stats
     staging_id = None
     for row in rows:
-        payload = json.loads(row["payload_json"])
-        if row["kind"] != "new_person" and payload.get("space") != space:
-            continue
         row_id = int(row["item_id"])
         automatic = _eligible_assign(row, policy)
         if not automatic and not policy.native_review:
             stats["skipped"] += 1
             continue
         try:
-            faces = _source_faces(conn, payload, row["kind"], row["run_id"])
-            faces = [f for f in faces if f[1] == space]
+            payload = json.loads(row["payload_json"])
+            if row["kind"] != "new_person" and payload.get("space") != space:
+                continue
+            all_faces = _source_faces(conn, payload, row["kind"], row["run_id"])
+            faces = [f for f in all_faces if f[1] == space]
             if not faces:
                 stats["skipped"] += 1
                 continue
+            pending = _pending_faces(conn, row_id, faces)
             if preview or not can_write:
                 LOG.info("DRY RUN space=%s item=%s mode=%s faces=%s confidence=%s",
-                         space, row_id, "assign" if automatic else "unknown", len(faces), row["confidence"])
+                         space, row_id, "assign" if automatic else "unknown", len(pending), row["confidence"])
                 stats["skipped"] += 1
+                continue
+            retry = conn.execute(
+                "SELECT retry_at FROM spbf_native_retry WHERE review_id=? AND space=?",
+                (row_id, space),
+            ).fetchone()
+            if pending and retry and retry["retry_at"] > int(time.time()):
+                stats["deferred"] += 1
                 continue
             person_id = int(payload["person_id"]) if automatic else None
             if automatic and person_id <= 0:
                 raise ValueError("Invalid predicted person_id")
-            if not automatic and staging_id is None:
+            group_id = _group_person(conn, row_id, space)
+            # Staging only seeds a space's group; an established one never needs it.
+            if pending and not automatic and group_id is None and staging_id is None:
                 staging_id = _staging_person(conn, client, space)
-            group_id = _group_person(conn, row_id)
-            # Skip completed faces before taking the per-cycle group slice.
-            pending = []
-            for face in faces:
-                prior = conn.execute("""
-                    SELECT state FROM spbf_native_journal
-                    WHERE review_id=? AND local_face_id=?
-                """, (row_id, face[0])).fetchone()
-                if not prior or prior["state"] != "complete":
-                    pending.append(face)
-            current_batch = pending[:policy.max_faces_per_group]
-            for face_id, face_space, photo_id, bbox in current_batch:
+            for face_id, face_space, photo_id, bbox in pending[:policy.max_faces_per_group]:
                 if stats["face_writes"] >= policy.max_writes:
-                    return stats  # resume next scheduled run
+                    return stats
+                # Count attempts, including failed/ambiguous writes, against the budget.
+                stats["face_writes"] += 1
                 if automatic:
                     _direct_assign(conn, client, row_id, face_id, face_space, photo_id, bbox, person_id)
                 else:
                     group_id = _apply_unknown_face(conn, client, row_id, face_id,
                                                    face_space, photo_id, bbox, group_id, staging_id)
-                stats["face_writes"] += 1
-            if len(pending) > len(current_batch):
-                continue  # complete remaining faces on later runs
-            _set_status(conn, row_id, "applied")
-            if automatic:
-                stats["assigned"] += 1
-            else:
-                stats["unknown_groups"] += 1
-        except Exception:
-            # Keep the queue pending. Persistent journal and NAS reread allow
-            # recovery; do not try an unsafe compensating delete of the face.
+            _clear_failure(conn, row_id, space)
+            # Completion is global only after every surviving face in every
+            # represented space has a completed journal record.
+            if not _pending_faces(conn, row_id, all_faces):
+                _set_status(conn, row_id, "applied")
+                if automatic:
+                    stats["assigned"] += 1
+                else:
+                    stats["unknown_groups"] += 1
+        except Exception as exc:
             stats["failed"] += 1
             LOG.exception("Could not apply proposal review_id=%s space=%s", row_id, space)
+            if can_write:
+                _record_failure(conn, row_id, space, exc)
+            # A bounded circuit breaker remains useful for NAS-wide outages,
+            # but deferred rows no longer monopolize subsequent invocations.
             if stats["failed"] >= 3:
                 break
     return stats
@@ -446,6 +494,12 @@ def _report(conn, data_dir) -> None:
                        "local_face_id": int(row["local_face_id"]),
                        "space": row["space"], "photo_id": int(row["photo_id"]),
                        "state": row["state"], "updated_at": row["updated_at"]})
+    for row in conn.execute("""
+        SELECT r.review_id, r.space, r.failures, r.retry_at, r.error
+        FROM spbf_native_retry r JOIN review_queue q ON q.item_id = r.review_id
+        WHERE q.status = 'pending'
+    """):
+        output.append({"type": "deferred_native_proposal", **dict(row)})
     for row in conn.execute("""
         SELECT item_id, kind, payload_json, confidence FROM review_queue
         WHERE status='pending' AND kind IN ('reassign','merge','merge_named')

@@ -213,3 +213,147 @@ def test_edge_detections_are_clipped_not_fatal():
     ])
     faces = nr._source_faces(conn, {"face_ids": [1, 2, 3]}, "new_person", None)
     assert [(f[0], f[3]) for f in faces] == [(1, (0.0, 0.8, 0.15, 1.0)), (3, (0.1, 0.2, 0.2, 0.4))]
+
+
+def _queue_db():
+    import sqlite3
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    conn.execute("""CREATE TABLE review_queue (
+        item_id INTEGER PRIMARY KEY, kind TEXT, status TEXT, payload_json TEXT,
+        confidence REAL, run_id INTEGER, decided_at INTEGER
+    )""")
+    return conn
+
+
+def test_multispace_group_completion_and_ids(monkeypatch):
+    from synopticon import native_review as nr
+    conn = _queue_db()
+    conn.execute("INSERT INTO review_queue VALUES (1,'new_person','pending','{}',NULL,1,NULL)")
+    bbox = (.1, .2, .3, .4)
+    faces = [(11, "personal", 101, bbox), (12, "shared", 101, bbox),
+             (13, "shared", 102, bbox)]
+    monkeypatch.setattr(nr, "_source_faces", lambda *a: faces)
+    monkeypatch.setattr(nr, "_staging_person", lambda *a: 5)
+    calls = []
+
+    def apply(conn, client, rid, fid, space, photo, bbox, group, staging):
+        calls.append((space, fid, group))
+        group = group or (91 if space == "personal" else 92)
+        nr._save_group(conn, rid, space, group)
+        nr._note(conn, rid, fid, space, photo, fid + 100, group, "complete")
+        return group
+
+    monkeypatch.setattr(nr, "_apply_unknown_face", apply)
+    policy = nr.Policy(write=True, native_review=True, max_faces_per_group=1)
+    nr.process(conn, object(), "personal", policy)
+    assert conn.execute("SELECT status FROM review_queue").fetchone()[0] == "pending"
+    nr.process(conn, object(), "shared", policy)
+    assert conn.execute("SELECT status FROM review_queue").fetchone()[0] == "pending"
+    nr.process(conn, object(), "shared", policy)
+    assert conn.execute("SELECT status FROM review_queue").fetchone()[0] == "applied"
+    assert calls == [("personal", 11, None), ("shared", 12, None), ("shared", 13, 92)]
+    assert nr._group_person(conn, 1, "personal") == 91
+    assert nr._group_person(conn, 1, "shared") == 92
+
+
+def test_established_group_continues_without_staging(monkeypatch):
+    from synopticon import native_review as nr
+    conn = _queue_db()
+    conn.execute("INSERT INTO review_queue VALUES (1,'new_person','pending','{}',NULL,1,NULL)")
+    nr._journal(conn)
+    nr._save_group(conn, 1, "personal", 91)
+    monkeypatch.setattr(nr, "_source_faces",
+                        lambda *a: [(11, "personal", 101, (.1,.2,.3,.4))])
+
+    def no_staging(*a):
+        raise ValueError("No unnamed staging person in personal")
+
+    def apply(conn, client, rid, fid, space, photo, bbox, group, staging):
+        assert (group, staging) == (91, None)
+        nr._note(conn, rid, fid, space, photo, 111, group, "complete")
+        return group
+
+    monkeypatch.setattr(nr, "_staging_person", no_staging)
+    monkeypatch.setattr(nr, "_apply_unknown_face", apply)
+    stats = nr.process(conn, object(), "personal", nr.Policy(write=True, native_review=True))
+    assert (stats["failed"], stats["unknown_groups"]) == (0, 1)
+
+
+def test_persistent_failures_do_not_starve_queue(monkeypatch):
+    import json
+    from synopticon import native_review as nr
+    conn = _queue_db()
+    for i in range(1, 5):
+        payload = json.dumps({"face_id": i, "space": "personal"})
+        conn.execute("INSERT INTO review_queue VALUES (?, 'low_confidence','pending',?,.1,1,NULL)",
+                     (i, payload))
+    monkeypatch.setattr(nr, "_source_faces",
+                        lambda c, p, *a: [(p["face_id"], "personal", 100, (.1,.2,.3,.4))])
+    monkeypatch.setattr(nr, "_staging_person", lambda *a: 5)
+    monkeypatch.setattr(nr.time, "time", lambda: 10000)
+    attempts = []
+
+    def apply(conn, client, rid, fid, space, photo, bbox, group, staging):
+        attempts.append(rid)
+        if rid < 4:
+            raise RuntimeError("persistent conflict")
+        nr._note(conn, rid, fid, space, photo, 99, 99, "complete")
+        return 99
+
+    monkeypatch.setattr(nr, "_apply_unknown_face", apply)
+    policy = nr.Policy(write=True, native_review=True)
+    assert nr.process(conn, object(), "personal", policy)["failed"] == 3
+    result = nr.process(conn, object(), "personal", policy)
+    assert result["failed"] == 0
+    assert result["deferred"] == 3
+    assert attempts == [1, 2, 3, 4]
+    assert conn.execute("SELECT status FROM review_queue WHERE item_id=4").fetchone()[0] == "applied"
+    assert conn.execute("SELECT COUNT(*) FROM spbf_native_retry").fetchone()[0] == 3
+
+
+def test_deferred_row_retried_after_backoff(monkeypatch):
+    import json
+    from synopticon import native_review as nr
+    conn = _queue_db()
+    payload = json.dumps({"face_id": 1, "space": "personal"})
+    conn.execute("INSERT INTO review_queue VALUES (1,'low_confidence','pending',?,.1,1,NULL)",
+                 (payload,))
+    monkeypatch.setattr(nr, "_source_faces",
+                        lambda c, p, *a: [(1, "personal", 100, (.1,.2,.3,.4))])
+    monkeypatch.setattr(nr, "_staging_person", lambda *a: 5)
+    now = [10000]
+    monkeypatch.setattr(nr.time, "time", lambda: now[0])
+    outcomes = [RuntimeError("transient"), None]
+
+    def apply(conn, client, rid, fid, space, photo, bbox, group, staging):
+        outcome = outcomes.pop(0)
+        if outcome:
+            raise outcome
+        nr._note(conn, rid, fid, space, photo, 99, 99, "complete")
+        return 99
+
+    monkeypatch.setattr(nr, "_apply_unknown_face", apply)
+    policy = nr.Policy(write=True, native_review=True)
+    assert nr.process(conn, object(), "personal", policy)["failed"] == 1
+    assert nr.process(conn, object(), "personal", policy)["deferred"] == 1
+    now[0] += 3600
+    assert nr.process(conn, object(), "personal", policy)["unknown_groups"] == 1
+    assert conn.execute("SELECT COUNT(*) FROM spbf_native_retry").fetchone()[0] == 0
+
+
+def test_report_omits_retries_of_settled_proposals(tmp_path):
+    import json
+    from synopticon import native_review as nr
+    conn = _queue_db()
+    conn.execute("CREATE TABLE faces (face_id INTEGER, space TEXT, photo_id INTEGER, "
+                 "detector TEXT, det_score REAL)")
+    conn.execute("INSERT INTO review_queue VALUES (1,'new_person','pending','{}',NULL,1,NULL)")
+    conn.execute("INSERT INTO review_queue VALUES (2,'new_person','applied','{}',NULL,1,NULL)")
+    nr._journal(conn)
+    for rid in (1, 2, 3):
+        nr._record_failure(conn, rid, "personal", RuntimeError("conflict"))
+    nr._report(conn, tmp_path)
+    issues = json.loads((tmp_path / "spbf-issues.json").read_text())
+    deferred = [i["review_id"] for i in issues if i["type"] == "deferred_native_proposal"]
+    assert deferred == [1]

@@ -43,6 +43,14 @@ By default SPBF_WRITE_ENABLED=false. Enable BOTH SPBF_WRITE_ENABLED=true and SPB
 
 Writes are non-atomic, but a per-face journal records intentions and results, and subsequent runs reread Synology Photos before modifying anything. Interrupted operations can temporarily leave a face in the staging group until recovery. Every write is audited.
 
+A cluster spanning Personal and Shared Space becomes one native People group per space;
+its proposal is done only once every space has finished.
+SPBF_MAX_WRITES caps face write attempts, failed ones included, per space and run.
+A proposal that fails is retried on later cycles with exponential backoff,
+from one hour up to one week, behind fresh proposals;
+other spaces and accounts keep running.
+Until it succeeds, spbf-issues.json lists it as `deferred_native_proposal` with its last error.
+
 ## Calibrated automatic assignment
 
 Enable SPBF_AUTO_ASSIGN_ENABLED=true only alongside SPBF_CALIBRATION_APPROVED=true, after evaluating identity precision against your own labeled holdout. SPBF_MIN_SIMILARITY is an embedding similarity, NOT a calibrated probability. Existing named annotations are never automatically reassigned, merged or deleted.
