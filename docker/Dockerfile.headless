@@ -1,0 +1,21 @@
+# CPU-only, GUI-free Synopticon fork for your Disk Station.
+FROM python:3.11-slim-bookworm AS builder
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
+WORKDIR /app
+ENV UV_PROJECT_ENVIRONMENT=/opt/venv UV_COMPILE_BYTECODE=1
+RUN apt-get update && apt-get install -y --no-install-recommends build-essential     && rm -rf /var/lib/apt/lists/*
+COPY pyproject.toml uv.lock ./
+RUN uv sync --frozen --no-install-project --no-dev --extra cpu --extra faiss
+COPY . .
+RUN uv sync --frozen --no-dev --extra cpu --extra faiss
+
+FROM python:3.11-slim-bookworm AS runtime
+RUN apt-get update && apt-get install -y --no-install-recommends libglib2.0-0     && rm -rf /var/lib/apt/lists/*
+COPY --from=builder /opt/venv /opt/venv
+COPY --from=builder /app/src /app/src
+COPY --from=builder /app/scripts /app/scripts
+WORKDIR /app
+ENV PATH="/opt/venv/bin:$PATH"     SYNOPTICON_STORAGE__DATA_DIR=/data     SYNOPTICON_STORAGE__MODELS_DIR=/models     SYNOPTICON_INFERENCE__DEVICE=cpu
+VOLUME ["/data", "/models"]
+ENTRYPOINT ["synopticon"]
+CMD ["--help"]

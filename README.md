@@ -1,3 +1,15 @@
+# Synology Photos Better Faces — headless fork
+
+This fork runs an entirely headless, CPU-only face recognition service for Synology Photos, supporting multiple DSM Personal Spaces, Shared Space, and native *Who's this?* review. Configuration is entirely through Docker Compose environment variables. There is **no companion UI or exposed port**.
+
+**[Deployment instructions](docs/HEADLESS.md)** · **[Docker Compose project](deploy/compose.yaml)** · **[Implementation PR](https://github.com/christian-steinmeyer/Synology-Photos-Better-Faces/pull/1)**
+
+All Photos writes are disabled by default; native review and calibrated automatic assignment can be enabled separately after disposable-photo testing. The underlying unofficial API is subject to change.
+
+---
+
+## Original Synopticon project
+
 ![Synopticon logo](assets/Synopticon%20Hero.png)
 
 Synopticon is a toolkit to run alongside Synology Photos, consisting of a set of utilities that run over your library and take on the jobs DSM currently does poorly or not at all. It includes enhanced face recognition, robust face grouping, automatic face reassignment, duplicate photo deletion and much more.

@@ -189,6 +189,19 @@ def test_reassign_skips_cross_space_moves():
     assert result.reassigns == []
 
 
+def test_assign_never_targets_a_person_in_another_space():
+    settings = load_settings()
+    specs = [(i, [1, 0, 0, 0]) for i in range(1, 6)]
+    label_map = {i: ("personal", 100) for i in range(1, 4)}
+    face_ids, X, labels, lm, meta = _core_inputs(specs, [0] * 5, label_map)
+    meta[5]["space"] = "shared"  # unlabelled face from the other library
+    result = crossref._crossref_core(
+        face_ids, X, labels, lm, settings, meta, person_photos=set()
+    )
+    assert result.clusters[0].mapped_person == ("personal", 100)
+    assert [a["payload"]["face_id"] for a in result.assigns] == [4]
+
+
 def test_core_backward_compatible_without_syno_ids():
     settings = load_settings()
     specs = [(i, [1, 0, 0, 0]) for i in range(1, 6)]

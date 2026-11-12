@@ -293,8 +293,8 @@ def _crossref_core(
                 if fid in label_map:
                     continue
                 meta = face_meta.get(fid)
-                if meta is None:
-                    continue
+                if meta is None or meta["space"] != p_space:
+                    continue  # a person id only means something in its own space
                 photo_id = meta["photo_id"]
                 if (p_space, p_id, photo_id) in person_photos:
                     continue  # photo already tagged with this person
